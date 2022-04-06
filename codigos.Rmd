@@ -1,0 +1,840 @@
+---
+title: "Códigos"
+output: html_notebook
+---
+
+Configurações iniciais do R no notebook.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 999)
+library(glmnet)
+library(caret)
+library(rpart)
+library(tidyverse)
+library(pROC)
+library(magrittr)
+library(mltools)
+library(LICORS)
+library(reticulate)
+library(InformationValue)
+library(kableExtra)
+
+# Função que maximiza a estatística F1
+metrics.f1.max <- function(preds, labels, threshold = FALSE) {
+    
+    DT <- data.table::data.table(y_true = labels, y_prob = preds, key = "y_prob")
+    cleaner <- !duplicated(DT[, "y_prob"], fromLast = TRUE)
+    nump <- sum(labels)
+    numn <- length(labels) - nump
+    
+    DT[, fp_v := cumsum(y_true == 1)]
+    DT[, fn_v := numn - as.numeric(cumsum(y_true == 0))]
+    DT[, tp_v := nump - fp_v]
+    DT <- DT[cleaner, ]
+    DT[, f1s := 2 * tp_v / (2 * tp_v + fp_v + fn_v)]
+    
+    best_row <- which.max(DT$f1s)
+    
+    if (length(best_row) > 0) {
+        if (threshold) {
+            return(c(DT$f1s[best_row[1]], DT$y_prob[best_row[1]]))
+        } else {
+            return(c(DT$f1s[best_row[1]]))
+        }
+    } else {
+        if (threshold) {
+            return(c(-1, -1))
+        } else {
+            return(-1)
+        }
+    }
+    
+}
+
+# Função que calcula as métricas utilizadas no estudo
+performance <- function(entrada){
+  lista <- list('KS' = 0, 'AUC' = 0, 'F1' = 0,
+                'Acurácia' = 0, 'SQRes' = 0)
+  
+  lista$KS <- as.numeric(ks.test(as.numeric(unlist(entrada %>%
+                                                     filter(Y==1) %>% select(S))),
+                                 as.numeric(unlist(entrada %>%
+                                                     filter(Y==0) %>% select(S))))$statistic)
+  
+  lista$AUC <- auc_roc(entrada$S,entrada$Y)
+  
+  corte_max_F1 <- metrics.f1.max(entrada$S, entrada$Y, threshold = T)[2]
+  
+  cm <- caret::confusionMatrix(as.numeric(entrada$S >= corte_max_F1) %>% as.factor(),
+                               entrada$Y %>% as.factor(),
+                               positive="1")
+  
+  lista$F1 <- cm$byClass['F1'] %>% as.numeric()
+  
+  lista$Acurácia <- cm$overall[1] %>% as.numeric()
+
+  lista$SQRes <- sum((entrada$Y - entrada$S)^2)
+  
+  return(lista %>% suppressWarnings()) 
+}
+
+# Função que traz a matriz de confusão, com o corte que maximiza a F1
+matriz_confusao <- function(entrada){
+  corte_max_F1 <- metrics.f1.max(entrada$S, entrada$Y, threshold = T)[2]
+  
+  cm <- caret::confusionMatrix(as.numeric(entrada$S >= corte_max_F1) %>% as.factor(),
+                               entrada$Y %>% as.factor(),
+                               positive="1")
+  
+  return(cm$table)
+}
+```
+
+Configurações iniciais do Python no notebook.
+
+```{python, include=FALSE}
+from sklearn.model_selection import StratifiedKFold
+
+import pandas as pd
+import scipy 
+from scipy import optimize, stats
+import numpy as np
+
+# Função sigmoide
+def sigmoid(z):
+    return(1 / (1+np.exp(-z)))
+
+# Calculando as probabilidades da logística
+def probs_logistica(obs, parametros):
+    return sigmoid(np.matmul(obs, parametros))
+
+# Calculando as probabilidades das logística limitada
+def probs_limitada(obs, parametros):
+    return (parametros[0] * sigmoid(np.matmul(obs, parametros[1:])))
+```
+
+No estudo, não será disponibilizado o conjunto de dados, por motivos de confidencialidade. Entretanto, o conjunto foi separado da seguinte forma durante a aplicação:
+
+```{r}
+matriz_treinoF   # Conjunto de treinamento 
+                 # (70% do conjunto original)
+
+matriz_treino    # Conjunto de treinamento 2.0
+                 # (70% do conjunto de treinamento)
+
+matriz_valicadao # Conjunto de validação 
+                 # (30% do conjunto de treinamento)
+
+matriz_teste     # Conjunto de teste 
+                 # (30% do conjunto original)
+```
+
+Em todas as matrizes, as variáveis categóricas já foram transformadas em dummies, e existe uma coluna de intercepto em todas (que será útil para aplicação no Python).
+
+Regressão logística:
+
+```{r}
+# Modelo logístico
+logistica <- glm(Y ~ .,
+                 data=matriz_treinoF %>% select(-`(Intercept)`),
+                 family='binomial') 
+# Medindo a performance
+Preds <- data.frame(predict(logistica, 
+                            newdata = matriz_teste,
+                            type = 'response'), matriz_teste$Y)
+colnames(Preds) <- c('S', 'Y')
+perf_logistica <- performance(Preds)
+matriz_confusao(Preds)
+```
+
+Regressão logística limitada:
+
+Separando base para o Python e os chutes iniciais.
+
+```{r}
+matriz_para_limitada <- matriz_treinoF
+coefs_logistica <- coef(logistica)
+# Caso algum parâmetro divergir durante a estimação, será transformado em 0
+coefs_logistica <- ifelse(is.na(coefs_logistica), 0, coefs_logistica)
+```
+
+```{python}
+def neg_log_veros_limitada(parametros):
+    sigmoide = (np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:])) / (1 + np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:]))))
+    return - np.sum(dados.iloc[:, -1] * np.log(parametros[0]*sigmoide) +
+                    (1 - dados.iloc[:, -1]) * np.log(1 - parametros[0]*sigmoide))
+                    
+dados = pd.DataFrame(r.matriz_para_limitada)
+
+# Inicialização com parâmetros zerados
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, r.coefs_logistica])
+# Todos os parâmetros não terão restrições, com exceção do primeiro
+# que se refere ao \omega, variando no intervalo (0,1).
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+# Otimizando a função objetivo
+logistica_limitada = scipy.optimize.minimize(neg_log_veros_limitada, parametros_ini, 
+                                             method='L-BFGS-B', bounds=restricoes,
+                                             options={'maxiter':1e3})
+# Resgatando os coeficientes estimados                                             
+coefs_logistica_limitada_scipy = logistica_limitada.x          
+```
+
+Medindo a performance
+
+```{r}
+matriz_para_limitada_teste <- matriz_teste 
+```
+
+```{python}
+dados = r.matriz_para_limitada_teste
+
+predito_limitada = probs_limitada(dados.iloc[:, :-1], logistica_limitada.x)
+```
+
+```{r}
+Preds_lim <- data.frame(py$predito_limitada, matriz_para_limitada_teste$Y)
+colnames(Preds_lim) <- c('S', 'Y')
+perf_logistica_limitada <- performance(Preds_lim)
+matriz_confusao(Preds_lim)
+```
+
+Normalizando as matrizes para o LASSO.
+
+```{r}
+n_treino <- dim(matriz_treinoF)[1]
+matriz_normalizada <- apply(matriz_treinoF %>% select(-`(Intercept)`, -Y),
+                            2, 
+                            function(x) (x  - mean(x))/sqrt(var(x) * (n_treino - 1) / n_treino))
+
+matriz_normalizada_teste <- matriz_teste %>% select(-`(Intercept)`, -Y)
+n_teste <- dim(matriz_normalizada_teste)[1] 
+for (i in 1:dim(matriz_normalizada_teste)[2]){
+  matriz_normalizada_teste[,i] <- (matriz_normalizada_teste[,i] -
+                                     mean(matriz_treinoF[,i+1]))/(sqrt(var(matriz_treinoF)[i+1,i+1] *
+                                                                               (n_teste - 1) / n_teste))
+}
+
+matriz_normalizada_validacao <- matriz_validacao %>% select(-`(Intercept)`, -Y)
+n_validacao <- dim(matriz_normalizada_validacao)[1] 
+for (i in 1:dim(matriz_normalizada_validacao)[2]){
+  matriz_normalizada_validacao[,i] <- (matriz_normalizada_validacao[,i] -
+                                     mean(matriz_treinoF[,i+1]))/(sqrt(var(matriz_treinoF)[i+1,i+1] *
+                                                                               (n_validacao - 1) / n_validacao))
+}
+
+matriz_normalizada_treino_k <- matriz_treino %>% select(-`(Intercept)`, -Y)
+n_treino_k <- dim(matriz_normalizada_treino_k)[1] 
+for (i in 1:dim(matriz_normalizada_treino_k)[2]){
+  matriz_normalizada_treino_k[,i] <- (matriz_normalizada_treino_k[,i] -
+                                     mean(matriz_treinoF[,i+1]))/(sqrt(var(matriz_treinoF)[i+1,i+1] *
+                                                                               (n_treino_k - 1) / n_treino_k))
+}
+
+matriz_normalizada_limitada <- cbind.data.frame(Intercepto = 1, 
+                                                matriz_normalizada,
+                                                Y=matriz_para_limitada$Y)
+
+matriz_normalizada_limitada_teste <- cbind.data.frame(Intercepto = 1, 
+                                                      matriz_normalizada_teste, 
+                                                      Y=matriz_para_limitada_teste$Y)
+
+matriz_normalizada_limitada_validacao <- cbind.data.frame(Intercepto = 1, 
+                                                          matriz_normalizada_validacao, 
+                                                          Y=matriz_validacao$Y)
+
+matriz_normalizada_limitada_treino_k <- cbind.data.frame(Intercepto = 1, 
+                                                         matriz_normalizada_treino_k, 
+                                                         Y=matriz_treino$Y)
+```
+
+Regressão Logística com LASSO.
+
+```{r}
+set.seed(2022)
+# p traz a dimensão das covariáveis, (removendo Y)
+p <- dim(matriz_normalizada_limitada)[2] - 1 
+# Validação para encontrar lambda
+cv_lasso <- cv.glmnet(as.matrix(matriz_normalizada_limitada[, 2:p]),
+                      as.matrix(matriz_normalizada_limitada[, p+1]), alpha = 1, 
+                      family='binomial', type.measure = 'auc', nfolds = 5, 
+                      standardize = F)
+# Ajustando o LASSO
+ajuste_lasso <- glmnet(as.matrix(matriz_normalizada_limitada[, 2:p]),
+                       as.matrix(matriz_normalizada_limitada[, p+1]), alpha = 1, 
+                       family='binomial', standardize = F)
+# Pegando as predições com o melhor lambda
+predito_lasso <- predict(ajuste_lasso,
+                         s = cv_lasso$lambda.min,
+                         newx=as.matrix(matriz_normalizada_limitada_teste[, 2:p]), type='response')
+# Separando esse lambda, que será utilizado no Python
+lambda_min <- cv_lasso$lambda.min
+
+# Medindo a performance
+Preds_lasso <- data.frame(predito_lasso,matriz_normalizada_limitada_teste$Y)
+colnames(Preds_lasso) <- c('S', 'Y')
+perf_lasso <- performance(Preds_lasso)
+matriz_confusao(Preds_lasso)
+```
+
+Regressão Logística Limitada com LASSO.
+
+
+```{python}
+dados = pd.DataFrame(r.matriz_normalizada_limitada)
+# Aplicando o mesmo lambda que foi utilizado na logística usual.
+lambd = r.lambda_min 
+
+def neg_log_veros_limitada_lasso(parametros):
+    sigmoide = (np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:])) /
+                (1 + np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:]))))
+    return - np.sum(np.multiply(dados.iloc[:, -1], np.log(np.multiply(parametros[0],sigmoide))) +
+                    np.multiply((1-dados.iloc[:, -1]), np.log(1 - np.multiply(parametros[0],sigmoide)))) \
+           + lambd * np.sum(np.absolute(parametros[2:]))
+
+
+
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, np.zeros(dados.shape[1] - 1)])
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+logistica_limitada_lasso = scipy.optimize.minimize(neg_log_veros_limitada_lasso, parametros_ini, 
+                                       method='L-BFGS-B', bounds=restricoes,
+                                       options={'maxiter':1e3})
+                                       
+coefs_limitada_LASSO = logistica_limitada_lasso.x                                       
+```
+
+```{python}
+dados = pd.DataFrame(r.matriz_normalizada_limitada_teste)
+
+predito_limitada_lasso = probs_limitada(dados.iloc[:, :-1], logistica_limitada_lasso.x)
+```
+
+Sumarizando os resultados
+
+```{r}
+Preds_lasso_lim <- data.frame(py$predito_limitada_lasso,
+                              matriz_normalizada_limitada_teste$Y)
+colnames(Preds_lasso_lim) <- c('S', 'Y')
+perf_limitada_lasso <- performance(Preds_lasso_lim)
+matriz_confusao(Preds_lasso_lim)
+```
+
+Reconstruindo os modelos, agora com balanceamento e diversificação
+
+```{r}
+resumo_log <- list(K=0, KS=0, AUC=0, Ponderamento='NULL')
+
+for (k in 2:15){
+  inicial <- Sys.time()
+  set.seed(2022)
+  legitimas <- matriz_treino %>% 
+                 filter(Y==0)
+  
+  fraudulentas <- matriz_treino %>% 
+                    filter(Y==1)
+ 
+  n <- dim(fraudulentas)[1] # Tamanho da amostra bagging
+
+  # Balanceamento
+  balanceamento <- matriz_treino %>% 
+    filter(Y==0) %>%
+    kmeanspp(k = k, iter.max = 250, algorithm = 'Lloyd')
+  
+  # Diversificação - criará k subconjuntos (k-ésimo cluster + bootstrap das fraudes)
+  for (i in 1:k){
+    eval(parse(text = paste0('subconjunto_',i,'= 
+  rbind(fraudulentas[sample(1:n, n, replace = T),],
+        legitimas %>% filter(balanceamento$cluster == ',i,'))')))
+  }
+  
+  # Balanceamento e diversificação
+  # Treinando os k subconjuntos e avaliando nas transações complementares do conjunto de treinamento
+  alpha_KS  <- c()
+  alpha_AUC <- c()
+  for (i in 1:k){
+    eval(parse(text = paste0("logistica_",i," <- glm(Y ~ ., data=subconjunto_",i,", family='binomial') %>% suppressWarnings();
+    predito_logistica_",i," <- predict(logistica_",i,",
+                               newdata=matriz_treino[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),],
+                               type='response') %>% suppressWarnings();
+    Preds_",i," <- data.frame(predito_logistica_",i,",matriz_treino[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),'Y']);
+    colnames(Preds_",i,") <- c('S', 'Y');
+    perf_",i," <- suppressWarnings(performance(Preds_",i,"));
+    alpha_KS <- c(alpha_KS, 1 / (1 + exp(-perf_",i,"$KS)));
+    alpha_AUC <- c(alpha_AUC, 1 / (1 + exp(-perf_",i,"$AUC)));"                       
+    )))
+  }
+  
+  # Montando classificador final
+  df_preds <- data.frame(Y=matriz_validacao$Y)
+  for (i in 1:k){
+    eval(parse(text = paste0("
+  preds_teste_",i," <- predict(logistica_",i,", 
+                               newdata= matriz_validacao, type='response') %>% suppressWarnings();
+  df_preds$C",i," <- as.numeric(unlist(preds_teste_",i,"))")))
+  }
+
+  df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS/sum(alpha_KS))
+  df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC/sum(alpha_AUC))
+
+  resumo_log$K <- c(resumo_log$K,k)
+  resumo_log$KS <- c(resumo_log$KS,performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))$KS)
+  resumo_log$AUC <- c(resumo_log$AUC,performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))$AUC)
+  resumo_log$Ponderamento <- c(resumo_log$Ponderamento,'Via KS')
+  
+  resumo_log$K <- c(resumo_log$K,k)
+  resumo_log$KS <- c(resumo_log$KS,performance(data.frame(Y=df_preds$Y, S=df_preds$Final_AUC))$KS)
+  resumo_log$AUC <- c(resumo_log$AUC,performance(data.frame(Y=df_preds$Y, S=df_preds$Final_AUC))$AUC)
+  resumo_log$Ponderamento <- c(resumo_log$Ponderamento,'Via AUC')
+  cat('\nk =',k,'\n')
+  print(Sys.time() - inicial)
+}
+
+print(data.frame(resumo_log) %>% filter(K != 0) %>% arrange(desc(AUC+KS)) %>% head(10))
+```
+
+Após encontrar o melhor k, repetir o processo para todo o treinamento.
+Neste estudo, encontramos k=8.
+
+```{r}
+set.seed(2022)
+k = 8
+legitimas <- matriz_treinoF %>% 
+  filter(Y==0)
+fraudulentas <- matriz_treinoF %>%  
+  filter(Y==1) 
+
+# Balanceando com o k-means
+balanceamento <- matriz_treinoF %>% 
+  filter(Y==0) %>% 
+  kmeanspp(k = k, iter.max = 250, algorithm = 'Lloyd')
+
+# Diversificação com o bagging
+n <- dim(fraudulentas)[1] # Tamanho amostral
+# fraudulentas[sample(1:n, n, replace = T),] # Bootstrap não-paramétrico
+# Anexando amostra bootstrap não-paramétrica com cluster
+for (i in 1:k){
+  eval(parse(text = paste0('subconjunto_',i,'= 
+  rbind(fraudulentas[sample(1:n, n, replace = T),], 
+        legitimas %>% filter(balanceamento$cluster == ',i,'));')))
+}
+```
+
+Ajustando os k submodelos.
+
+```{r}
+set.seed(2022)
+
+## Treinando os k subconjuntos
+alpha_KS  <- c()
+alpha_AUC <- c()
+p <- dim(subconjunto_1)[2]-1
+for (i in 1:k){
+  eval(parse(text = paste0(
+    "logistica_",i," <- glm(Y ~ . -1 , data=subconjunto_",i,", family='binomial') %>% suppressWarnings();
+    start_coefs_",i," <- ifelse(is.na(coef(logistica_",i,")), 0, coef(logistica_",i,"));
+    predito_logistica_",i," <- predict(logistica_",i,",
+                               newdata=matriz_treinoF[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),],
+                               type='response') %>% suppressWarnings();
+    Preds_",i," <- data.frame(predito_logistica_",i,",
+                              matriz_treinoF[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),'Y']) %>% suppressWarnings();
+    colnames(Preds_",i,") <- c('S', 'Y');
+    perf_",i," <- performance(Preds_",i,");
+    alpha_KS <- c(alpha_KS, 1 / (1 + exp(-perf_",i,"$KS)));
+    alpha_AUC <- c(alpha_AUC, 1 / (1 + exp(-perf_",i,"$AUC)));"                       
+  )))
+  cat('Submodelo ',i,'/',k,' treinado!\n', sep='')
+}
+```
+
+Montando o classificador final
+
+```{r}
+set.seed(2022)
+df_preds <- data.frame(Y=matriz_teste$Y)
+for (i in 1:k){
+  eval(parse(text = paste0("
+  preds_teste_",i," <- predict(logistica_",i,", 
+                               newdata = matriz_teste, type='response') %>% suppressWarnings();
+  df_preds$C",i," <- as.numeric(unlist(preds_teste_",i,"))")))
+}
+
+# Ponderando as predições pela performance 
+df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS/sum(alpha_KS))
+df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC/sum(alpha_AUC))
+
+perf_balan_logistica <- performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+matriz_confusao(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+```
+
+Replicando o processo, com a regressão logística limitada.
+Não consegui fazer de forma escalável no Python, então é bem manual essa etapa.
+
+Subconjunto 1 (repetir esse trecho k vezes)
+
+```{python}
+dados = r.subconjunto_1
+
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, r.start_coefs_1])
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+logistica_limitada_1 = scipy.optimize.minimize(neg_log_veros_limitada,
+                                               parametros_ini,
+                                               method='L-BFGS-B',
+                                               bounds=restricoes,
+                                               options={'maxiter':1e3})
+```
+
+.
+.
+.
+
+Subconjunto 8
+
+```{python}
+dados = r.subconjunto_8
+
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, r.start_coefs_8])
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+logistica_limitada_8 = scipy.optimize.minimize(neg_log_veros_limitada,
+                                               parametros_ini,
+                                               method='L-BFGS-B',
+                                               bounds=restricoes,
+                                               options={'maxiter':1e3})
+```
+
+Avaliando a performance do balanceamento e diversificação na Limitada.
+
+```{python}
+# Pegando os coeficientes de cada submodelo
+coefs_L_1 = logistica_limitada_1.x
+coefs_L_2 = logistica_limitada_2.x
+coefs_L_3 = logistica_limitada_3.x
+coefs_L_4 = logistica_limitada_4.x
+coefs_L_5 = logistica_limitada_5.x
+coefs_L_6 = logistica_limitada_6.x
+coefs_L_7 = logistica_limitada_7.x
+coefs_L_8 = logistica_limitada_8.x
+
+# Verificando a performance dos modelos nas transações complementares do treinamento
+# Aqui estamos pegando apenas as predições
+preditos_L_1 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_1.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_1)
+preditos_L_2 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_2.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_2)
+preditos_L_3 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_3.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_3)
+preditos_L_4 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_4.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_4)
+preditos_L_5 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_5.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_5)
+preditos_L_6 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_6.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_6)
+preditos_L_7 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_7.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_7)
+preditos_L_8 = probs_limitada(r.matriz_para_limitada.loc[\
+  set(r.matriz_para_limitada.index) - set(r.subconjunto_8.index),\
+  r.matriz_para_limitada.columns != 'Y'], coefs_L_8)
+```
+
+```{r}
+# Mensaurando a qualidade das predições feitas na chunck anterior,
+# para termos os alphas.
+alpha_KS_lim <- c()
+alpha_AUC_lim <- c()
+df_preds <- data.frame(Y=matriz_para_limitada_teste$Y)
+
+for (i in 1:k){
+  eval(parse(text = paste0(
+  'alpha_KS_lim <- c(alpha_KS_lim, suppressWarnings(
+  performance(data.frame(Y=matriz_para_limitada[names(py$preditos_L_',i,'), "Y"],
+  S=py$preditos_L_',i,')))$KS);
+
+  alpha_AUC_lim <- c(alpha_AUC_lim, suppressWarnings(
+  performance(data.frame(Y=matriz_para_limitada[names(py$preditos_L_',i,'), "Y"],
+  S=py$preditos_L_',i,')))$AUC);
+
+  preds_teste_',i,' <- py$probs_limitada(obs=matriz_para_limitada_teste %>% select(-Y),
+                       parametros = py$coefs_L_',i,');
+  
+  df_preds$C',i,' <- as.numeric(unlist(preds_teste_',i,'));')))
+}
+```
+
+Classificador final:
+
+```{r}
+df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS/sum(alpha_KS))
+df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC/sum(alpha_AUC))
+
+perf_balan_logistica_limitada <- performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+matriz_confusao(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+```
+
+Refazendo o processo, mas para os modelos com LASSO. 
+
+A busca pelo k será refeita, já que o modelo é diferente e os dados estão normalizados.
+
+Novamente, encontramos K na logística com LASSO, e replicamos para a logística limitada com LASSO. 
+
+```{r}
+resumo <- list(K=0, KS=0, AUC=0, Ponderamento='NULL')
+
+for (k in 2:15){
+  inicial <- Sys.time()
+  set.seed(2022)
+  legitimas <- matriz_normalizada_limitada_treino_k %>% filter(Y==0) 
+  fraudulentas <- matriz_normalizada_limitada_treino_k %>% filter(Y==1)
+  n <- dim(fraudulentas)[1] # Tamanho da amostra bagging
+
+  # Balanceamento
+  balanceamento <- matriz_normalizada_limitada_treino_k %>% 
+    filter(Y==0) %>%
+    kmeanspp(k = k, iter.max = 250, algorithm = 'Lloyd')
+  
+  # Diversificação
+  for (i in 1:k){
+    eval(parse(text = paste0('subconjunto_',i,'= 
+  rbind(fraudulentas[sample(1:n, n, replace = T),],
+        legitimas %>% filter(balanceamento$cluster == ',i,'))')))
+  }
+  
+  # Lasso com o balanceamento e diversificação
+  # Treinando os k subconjuntos
+  alpha_KS  <- c()
+  alpha_AUC <- c()
+  for (i in 1:k){
+    eval(parse(text = paste0("cv_lasso_",i," <- cv.glmnet(as.matrix(subconjunto_",i,"[, 2:p]),
+                                as.matrix(subconjunto_",i,"[, (p+1)]), alpha = 1, family='binomial',
+                                type.measure='auc', nfolds = 5, standardize = F);
+    ajuste_lasso_",i," <- glmnet(as.matrix(subconjunto_",i,"[, 2:p]),
+                             as.matrix(subconjunto_",i,"[, (p+1)]), alpha = 1, family='binomial',
+                             standardize = F);
+    predito_lasso_",i," <- predict(ajuste_lasso_",i,",
+                               s = cv_lasso_",i,"$lambda.min,
+                               newx=as.matrix(matriz_normalizada_limitada_treino_k[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),2:p]),
+                               type='response');
+    Preds_",i," <- data.frame(predito_lasso_",i,",matriz_normalizada_limitada_treino_k[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),(p+1)]);
+    colnames(Preds_",i,") <- c('S', 'Y');
+    perf_",i," <- suppressWarnings(performance(Preds_",i,"));
+    alpha_KS <- c(alpha_KS, 1 / (1 + exp(-perf_",i,"$KS)));
+    alpha_AUC <- c(alpha_AUC, 1 / (1 + exp(-perf_",i,"$AUC)));"                       
+    )))
+  }
+  
+  # Montando classificador final
+  df_preds <- data.frame(Y=matriz_normalizada_limitada_validacao$Y)
+  for (i in 1:k){
+    eval(parse(text = paste0("
+  preds_teste_",i," <- predict(ajuste_lasso_",i,", 
+                           s = cv_lasso_",i,"$lambda.min,
+                           newx = as.matrix(matriz_normalizada_limitada_validacao[,2:p]), type='response');
+  df_preds$C",i," <- as.numeric(unlist(preds_teste_",i,"))")))
+  }
+
+  df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS/sum(alpha_KS))
+  df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC/sum(alpha_AUC))
+
+  resumo$K <- c(resumo$K,k)
+  resumo$KS <- c(resumo$KS,suppressWarnings(performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS)))$KS)
+  resumo$AUC <- c(resumo$AUC,suppressWarnings(performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS)))$AUC)
+  resumo$Ponderamento <- c(resumo$Ponderamento,'Via KS')
+  
+  resumo$K <- c(resumo$K,k)
+  resumo$KS <- c(resumo$KS,suppressWarnings(performance(data.frame(Y=df_preds$Y, S=df_preds$Final_AUC)))$KS)
+  resumo$AUC <- c(resumo$AUC,suppressWarnings(performance(data.frame(Y=df_preds$Y, S=df_preds$Final_AUC)))$AUC)
+  resumo$Ponderamento <- c(resumo$Ponderamento,'Via AUC')
+  cat('\nk =',k,'\n')
+  print(Sys.time() - inicial)
+}
+
+```
+
+Nessa bloco de modelos, o melhor k foi 2.
+
+Construindo o LASSO com balanceamento e diversificação com k=2:
+
+```{r}
+set.seed(2022)
+k = 2
+legitimas <- matriz_normalizada_limitada %>% filter(Y==0)
+fraudulentas <- matriz_normalizada_limitada %>% filter(Y==1) 
+
+# Balanceando com o k-means
+balanceamento <- matriz_normalizada_limitada %>% 
+  filter(Y==0) %>%
+  kmeanspp(k = k, iter.max = 250, algorithm = 'Lloyd')
+
+# Diversificação com o bagging
+n <- dim(fraudulentas)[1] # Tamanho amostral
+# fraudulentas[sample(1:n, n, replace = T),] # Bootstrap não-paramétrico
+# Anexando amostra bootstrap não-paramétrica com cluster
+for (i in 1:k){
+  eval(parse(text = paste0('subconjunto_',i,'= 
+  rbind(fraudulentas[sample(1:n, n, replace = T),],
+        legitimas %>% filter(balanceamento$cluster == ',i,'))')))
+}
+```
+
+```{r}
+set.seed(2022)
+## Treinando os k subconjuntos
+alpha_KS  <- c()
+alpha_AUC <- c()
+p <- dim(subconjunto_1)[2]-1
+for (i in 1:k){
+  eval(parse(text = paste0("
+    cv_lasso_",i," <- cv.glmnet(as.matrix(subconjunto_",i,"[, 2:p]),
+                                as.matrix(subconjunto_",i,"[, (p+1)]), alpha = 1, family='binomial',
+                                type.measure='auc', nfolds = 5, standardize = F);
+    ajuste_lasso_",i," <- glmnet(as.matrix(subconjunto_",i,"[, 2:p]),
+                             as.matrix(subconjunto_",i,"[, (p+1)]), alpha = 1, family='binomial',
+                              standardize = F);
+    predito_lasso_",i," <- predict(ajuste_lasso_",i,",
+                               s = cv_lasso_",i,"$lambda.min,  
+                               newx=as.matrix(matriz_normalizada_limitada[-unique(trunc(
+                                      as.numeric(rownames(subconjunto_",i,")))),2:p]),
+                               type='response');
+    Preds_",i," <- data.frame(predito_lasso_",i,
+        ",matriz_normalizada_limitada[-unique(trunc(as.numeric(rownames(subconjunto_",i,")))),(p+1)]);
+    colnames(Preds_",i,") <- c('S', 'Y');
+    perf_",i," <- suppressWarnings(performance(Preds_",i,"));
+    alpha_KS <- c(alpha_KS, 1 / (1 + exp(-perf_",i,"$KS)));
+    alpha_AUC <- c(alpha_AUC, 1 / (1 + exp(-perf_",i,"$AUC)));"                       
+  )))
+  cat('Submodelo ',i,'/',k,' treinado!\n', sep='')
+}
+```
+
+Verificando a performance
+
+```{r}
+set.seed(2022)
+df_preds <- data.frame(Y=matriz_normalizada_limitada_teste$Y)
+for (i in 1:k){
+  eval(parse(text = paste0("
+  preds_teste_",i," <- predict(ajuste_lasso_",i,", 
+                           s = cv_lasso_",i,"$lambda.min,
+                           newx = as.matrix(matriz_normalizada_limitada_teste[,2:p]), type='response');
+  df_preds$C",i," <- as.numeric(unlist(preds_teste_",i,"))")))
+}
+
+df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS/sum(alpha_KS))
+df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC/sum(alpha_AUC))
+
+performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+matriz_confusao(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+```
+
+Regressão logística limitada com LASSO. 
+
+Como no anterior, usamos o mesmo lambda que foi encontrado na logística com LASSO
+
+```{r}
+lambd_1 <- cv_lasso_1$lambda.min
+lambd_2 <- cv_lasso_2$lambda.min
+```
+
+Subconjunto 1
+
+```{python}
+dados = r.subconjunto_1
+lambd = r.lambd_1
+
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, np.zeros(dados.shape[1] - 1)])
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+def neg_log_veros_limitada_lasso(parametros):
+    sigmoide = (np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:])) /
+                (1 + np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:]))))
+    return - np.sum(np.multiply(dados.iloc[:, -1], np.log(np.multiply(parametros[0],sigmoide))) +
+                    np.multiply((1-dados.iloc[:, -1]), np.log(1 - np.multiply(parametros[0],sigmoide)))) \
+           + lambd * np.sum(np.absolute(parametros[2:]))
+
+logistica_limitada_lasso_1 = scipy.optimize.minimize(neg_log_veros_limitada_lasso,
+                                                     parametros_ini,
+                                                     method='L-BFGS-B',
+                                                     bounds=restricoes,
+                                                     options={'maxiter':1e3})
+```
+
+Subconjunto 2
+
+```{python}
+dados = r.subconjunto_2
+lambd = r.lambd_2
+
+omega_start = np.array([0.9])
+parametros_ini = np.concatenate([omega_start, np.zeros(dados.shape[1] - 1)])
+restricoes = tuple((None,None) if i != 0 else (0.00001, 0.99999) for i in range(dados.shape[1]))
+
+def neg_log_veros_limitada_lasso(parametros):
+    sigmoide = (np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:])) /
+                (1 + np.exp(np.matmul(dados.iloc[:, :-1], parametros[1:]))))
+    return - np.sum(np.multiply(dados.iloc[:, -1], np.log(np.multiply(parametros[0],sigmoide))) +
+                    np.multiply((1-dados.iloc[:, -1]), np.log(1 - np.multiply(parametros[0],sigmoide)))) \
+           + lambd * np.sum(np.absolute(parametros[2:]))
+
+logistica_limitada_lasso_2 = scipy.optimize.minimize(neg_log_veros_limitada_lasso,
+                                                     parametros_ini,
+                                                     method='L-BFGS-B',
+                                                     bounds=restricoes,
+                                                     options={'maxiter':1e3})
+```
+
+```{python}
+coefs_LL_1 = logistica_limitada_lasso_1.x
+coefs_LL_2 = logistica_limitada_lasso_2.x
+
+preditos_LL_1 = probs_limitada(r.matriz_normalizada_limitada.loc[\
+  set(r.matriz_normalizada_limitada.index) - set(r.subconjunto_1.index),\
+  r.matriz_normalizada_limitada.columns != 'Y'], coefs_LL_1)
+preditos_LL_2 = probs_limitada(r.matriz_normalizada_limitada.loc[\
+  set(r.matriz_normalizada_limitada.index) - set(r.subconjunto_2.index),\
+  r.matriz_normalizada_limitada.columns != 'Y'], coefs_LL_2)
+```
+
+```{r}
+alpha_KS_lim <- c()
+alpha_AUC_lim <- c()
+df_preds <- data.frame(Y=matriz_normalizada_limitada_teste$Y)
+
+for (i in 1:k){
+  eval(parse(text = paste0('alpha_KS_lim <- c(alpha_KS_lim, suppressWarnings(
+  performance(data.frame(Y=matriz_normalizada_limitada[names(py$preditos_LL_',i,'), "Y"],
+  S=py$preditos_LL_',i,')))$KS);
+  
+  alpha_AUC_lim <- c(alpha_AUC_lim, suppressWarnings(
+  performance(data.frame(Y=matriz_normalizada_limitada[names(py$preditos_LL_',i,'), "Y"],
+  S=py$preditos_LL_',i,')))$AUC);
+  
+  preds_teste_',i,' <- py$probs_limitada(obs=matriz_normalizada_limitada_teste %>% select(-Y),
+                       parametros = py$coefs_LL_',i,');
+  
+  df_preds$C',i,' <- as.numeric(unlist(preds_teste_',i,'));')))
+}
+```
+
+Verificando a performance
+
+```{r}
+df_preds$Final_KS <-  as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_KS_lim/sum(alpha_KS_lim))
+df_preds$Final_AUC <- as.matrix(df_preds[, 2:(k+1)]) %*% (alpha_AUC_lim/sum(alpha_AUC_lim))
+
+performance(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+matriz_confusao(data.frame(Y=df_preds$Y, S=df_preds$Final_KS))
+```
